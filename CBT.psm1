@@ -137,31 +137,43 @@ function Test-cbtBackupsCoverage {
 	};
 	
 	process {
-		$full = $Manifest | Where-Object { $_.Type -eq 'FULL' } | Select-Object -First 1;
-		$previousStart = $full.TimeStamp;
+		$full = $Manifest | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
+		
+		[DateTime]$previousStart = $full.TimeStamp;
 		$previousFile = 'FULL';
 		
 		if (-not $SkipDiffBackups) {
-			$diff = $Manifest | Where-Object { $_.Type -eq 'DIFF' } | Select-Object -First 1;
+			
+			Write-Verbose "-SkipDiffBackups is `$true. Checking for DIFF Backup....";
+			
+			$diff = $Manifest | Where-Object { $_.BackupType -eq 'DIFF' } | Select-Object -First 1;
 			if ($null -ne $diff) {
 				$previousStart = $diff.TimeStamp;
 				$previousFile = 'DIFF';
+				Write-Verbose "`tDIFF Found.";
 			}
 		}
 		
 		[PSCustomObject[]]$gaps = @();
-		foreach ($logBackup in $Manifest | Where-Object { $_.Type -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+		[PSCustomObject]$previousLogFile = $null;
+		foreach ($logBackup in $Manifest | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
 			[TimeSpan]$span = $logBackup.TimeStamp - $previousStart;
 			if ($span.TotalSeconds -gt $RpoSeconds) {
 				$gaps += @{
-					GapType	      = "$($previousFile)-to-LOG" # could be between FULL\DIFF and LOG, or could be between LOG and LOG.
-					GapSeconds    = $span.Seconds
-					RpoExceededBy = ($span.Seconds - $RpoSeconds)
+					GapType	      		= "$($previousFile)-to-LOG"; # could be between FULL\DIFF and LOG, or could be between LOG and LOG.
+					GapSeconds    		= $span.TotalSeconds;
+					RpoExceededBy 		= ($span.TotalSeconds - $RpoSeconds);
+					PreviousFile  		= $previousLogFile.FileName;
+					GappedFile    		= $logBackup.FileName;
+					PreviousTimeStamp 	= $previousFile.TimeStamp;
+					GappedTimeStamp 	= $logBackup.TimeStamp;
+					
 				}
 			}
 			
 			$previousFile = 'LOG';
 			$previousStart = $logBackup.TimeStamp;
+			$previousLogFile = $logBackup;
 		}
 		
 		# TODO: 
@@ -177,11 +189,13 @@ function Test-cbtBackupsCoverage {
 				$previousFile = 'LATEST_LOG';
 			}
 			$gaps += @{
-				GapType	      = "$($previousFile)-to-CHECK_TIME" # there might not (yet?) be any DIFFs/T-LOGs... 
-				GapSeconds    = $span.Seconds
-				RpoExceededBy = ($span.Seconds - $RpoSeconds)
-			}
-		}
+				GapType	      		= "$($previousFile)-to-CHECK_TIME"; # there might not (yet?) be any DIFFs/T-LOGs... 
+				GapSeconds    		= $span.TotalSeconds;
+				RpoExceededBy 		= ($span.TotalSeconds - $RpoSeconds);
+				PreviousFile  		= $previousLogFile.FileName;
+				PreviousTimeStamp 	= $previousFile.TimeStamp;
+			}   
+		}		
 		
 		return $gaps;
 	};
