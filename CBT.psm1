@@ -114,7 +114,7 @@ function Build-cbtS3BackupsFileManifest {
 
 function Copy-cbtS3BackupFilesLocally {
 	param (
-		[Parameter(Mandatory)]
+		[Parameter(Mandatory, ValueFromPipeline)]
 		[PSCustomObject]$Manifest,
 		[DateTime]$StopAt = [DateTime]::MinValue,			# ONLY exists for hand-off to RESTORE operations... 
 		[string]$TargetDirectory # hmm. do i need any kind of pattern thingy here? 
@@ -127,12 +127,12 @@ function Copy-cbtS3BackupFilesLocally {
 			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
 		}
 		
-		# TODO: normalize path for $TargetDirectory... i.e., if it ends with \ ... remove it. 
+		if ($TargetDirectory.EndsWith('\')) {
+			$TargetDirectory = $TargetDirectory.Substring(0, $TargetDirectory.Length - 1);
+		}
 		
 		if (-not (Test-Path $TargetDirectory)) {
-			# try to create the explicit path? 
-			
-			# and/or just throw? 
+			throw "Target Directory [$TargetDirectory] does NOT exist.";
 		}
 		
 		filter Copy-S3FileToLocal {
@@ -140,11 +140,14 @@ function Copy-cbtS3BackupFilesLocally {
 				[PSCustomObject]$File
 			);
 			
-			Read-S3Object -BucketName ($Manifest.BucketName) -Key $File.FullPath -File "$TargetDirectory\$($Manifest.DatabaseName)\$($File.FileName)" | Out-Null;
+			Read-S3Object -BucketName ($Manifest.BucketName) -Key $File.FullPath -File "$TargetDirectory\$($Manifest.Database)\$($File.FileName)" | Out-Null;
 		}
+		
+		$progressPref = $global:ProgressPreference;
 	};
 	
 	process {
+		$global:ProgressPreference = [System.Management.Automation.ActionPreference]::SilentlyContinue;
 		
 		# NOTE: if there's NOT a FULL (or DIFF) backup - that's fine, we MIGHT be 'topping up' (synchronizing) additional backups/etc. 
 		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
@@ -167,11 +170,8 @@ function Copy-cbtS3BackupFilesLocally {
 	};
 	
 	end {
-		
+		$global:ProgressPreference = $progressPref;
 	};
-	
-
-	
 }
 
 function Remove-cbtManifestEntriesForLocallyAvailableFiles {
@@ -293,7 +293,6 @@ function Test-cbtS3SecurityInfoIsSet {
 ##############################################################################################################
 ##  Internal:
 ##############################################################################################################
-
 filter Get-DateTimeFromS3FileName {
 	param (
 		[string]$FileName
