@@ -172,7 +172,7 @@ function Test-cbtBackupsCoverage {
 					RpoExceededBy 		= ($span.TotalSeconds - $RpoSeconds);
 					PreviousFile  		= $previousLogFile.FileName;
 					GappedFile    		= $logBackup.FileName;
-					PreviousTimeStamp 	= $previousFile.TimeStamp;
+					PreviousTimeStamp 	= $previousLogFile.TimeStamp;
 					GappedTimeStamp 	= $logBackup.TimeStamp;
 					
 				}
@@ -200,7 +200,7 @@ function Test-cbtBackupsCoverage {
 				GapSeconds    		= $span.TotalSeconds;
 				RpoExceededBy 		= ($span.TotalSeconds - $RpoSeconds);
 				PreviousFile  		= $previousLogFile.FileName;
-				PreviousTimeStamp 	= $previousFile.TimeStamp;
+				PreviousTimeStamp 	= $previousLogFile.TimeStamp;
 			}   
 		}		
 		
