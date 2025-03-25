@@ -21,7 +21,7 @@
 	ProcessorArchitecture = 'None'
 	RequiredModules	= @(
 		@{ ModuleName = "psi"; RequiredVersion = "0.3.8.0"	}
-		@{ ModuleName = "AWS.Tools.S3"; RequiredVersion = "4.1.0.0" }
+		@{ ModuleName = "AWS.Tools.S3"; RequiredVersion = "4.1.737" }
 	)
 	RequiredAssemblies = @()
 	ScriptsToProcess = @()
