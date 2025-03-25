@@ -7,8 +7,7 @@ function Build-cbtS3BackupsFileManifest {
 	param (
 		[Parameter(Mandatory)]
 		[string]$BucketName,
-		# TODO: might need some sort of @{} (dictionary) of path prefixes - for situations where FULL|DIFF|LOG files are kept in different buckets.
-		[string]$PathPrefix = "",
+		[string]$PathPrefix = "",   # TODO: might need some sort of @{} (dictionary) of path prefixes - for situations where FULL|DIFF|LOG files are kept in different buckets.
 		[Parameter(Mandatory)]
 		[string]$Database,
 		[DateTime]$StopAt = [DateTime]::MinValue # When $StopAt is a) specified, and b) 'farther back' than most RECENT FULL/DIFF backups, this'll grab most recent files from BEFORE $StopAt
@@ -39,7 +38,7 @@ function Build-cbtS3BackupsFileManifest {
 				[System.DateTime]$timestamp = Get-DateTimeFromS3FileName -FileName $fileName;
 				[int]$stripe = Get-StripeNumberFromS3FileName -FileName $fileName;
 				
-				$fileDetail = @{
+				[PSCustomObject]$fileDetail = [PSCustomObject]@{
 					BackupType = $Type.ToUpperInvariant()
 					Stripe	   = $stripe
 					TimeStamp  = $timestamp
@@ -80,7 +79,12 @@ function Build-cbtS3BackupsFileManifest {
 			}
 		}
 		
-		[PSCustomObject[]]$manifest = @();
+		[PSCustomObject]$manifest = [PSCustomObject]@{
+			PSTypeName = "CloudFilesManifest"
+			BucketName = $BucketName
+			Database = $Database
+			Files = @()
+		};
 	}
 	
 	process {
@@ -91,16 +95,16 @@ function Build-cbtS3BackupsFileManifest {
 		
 		Write-Verbose "Starting Manifest with FULL Backup: [$($full.FullPath)].";
 		
-		$manifest += $full;
+		$manifest.Files += $full;
 		$predecessor = $full.TimeStamp;
 		
 		$diff = Get-S3FileDetailsByPath -Type 'DIFF' -Predecessor $predecessor;
 		if ($null -ne $diff) {
 			$predecessor = $diff.TimeStamp;
-			$manifest += $diff;
+			$manifest.Files += $diff;
 		}
 		
-		$manifest += Get-S3FileDetailsByPath -Type 'LOG' -Predecessor $predecessor;
+		$manifest.Files += Get-S3FileDetailsByPath -Type 'LOG' -Predecessor $predecessor;
 	}
 	
 	end {
@@ -143,11 +147,11 @@ function Copy-cbtS3BackupFilesLocally {
 	process {
 		
 		# NOTE: if there's NOT a FULL (or DIFF) backup - that's fine, we MIGHT be 'topping up' (synchronizing) additional backups/etc. 
-		$full = $Manifest | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
+		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
 		Copy-S3FileToLocal -File $full;
 		# TODO: OPTION to initiate/kick-off RESTORE operation. (This'd HAVE to be done via START of an MSDB JOB - so that this is asynchronous.)
 		
-		$diff = $Manifest | Where-Object { $_.BackupType -eq 'DIFF'	} | Select-Object -First 1;
+		$diff = $Manifest.Files | Where-Object { $_.BackupType -eq 'DIFF'	} | Select-Object -First 1;
 		Copy-S3FileToLocal -File $diff;
 		# TODO: OPTION to 'apply' (which is a bit complicated.)
 		# 		So. There are 2 main options for the ability to kick-off RESTORE operations here. 
@@ -157,7 +161,7 @@ function Copy-cbtS3BackupFilesLocally {
 		# 			to simply apply a DIFF, then LOGs, or JUST logs (though... that's starting to be a hell of an overlap on/against dbo.apply_logs)
 		# 				ah. woah. maybe dbo.restore_databases calls into dbo.apply_logs once we get to logs? 
 		
-		foreach ($logBackup in $Manifest | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+		foreach ($logBackup in $Manifest.Files | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
 			Copy-S3FileToLocal -File $logBackup;
 		}
 	};
@@ -196,16 +200,9 @@ function Set-cbtS3SecurityInformation {
 	Initialize-AWSDefaultConfiguration -Region $Region -AccessKey ($SecretAndKeyAsCredentials.UserName) -SecretKey ($SecretAndKeyAsCredentials.GetNetworkCredential().Password);
 }
 
-# BARF. 
-# 	I mean, I know how ValueFromPipeline works... but... 
-# 		because I'm using a hashtable (PSCustomObject) for the output of Build-xxxManifest.... 
-# 			this is going through the contents of that HashTable - one row at a time. 
-# 			that's ... not what I want. 
-# 		which means I'm probably going to have to build a more custom class/object . 
 function Test-cbtBackupsCoverage {
 	param (
-		#[Parameter(Mandatory, ValueFromPipeline)]
-		[Parameter(Mandatory)]
+		[Parameter(Mandatory, ValueFromPipeline)]
 		[PSCustomObject]$Manifest,
 		[int]$RpoSeconds = 660,
 		[switch]$SkipDiffBackups = $true # Arguably, we're NOT just looking to see if we can recover without RPO violations; we're looking to see if there are ANY RPO violations within the backup chain. 
@@ -216,7 +213,7 @@ function Test-cbtBackupsCoverage {
 	};
 	
 	process {
-		$full = $Manifest | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
+		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
 		
 		[DateTime]$previousStart = $full.TimeStamp;
 		$previousFile = 'FULL';
@@ -225,7 +222,7 @@ function Test-cbtBackupsCoverage {
 			
 			Write-Verbose "-SkipDiffBackups is `$true. Checking for DIFF Backup....";
 			
-			$diff = $Manifest | Where-Object { $_.BackupType -eq 'DIFF' } | Select-Object -First 1;
+			$diff = $Manifest.Files | Where-Object { $_.BackupType -eq 'DIFF' } | Select-Object -First 1;
 			if ($null -ne $diff) {
 				$previousStart = $diff.TimeStamp;
 				$previousFile = 'DIFF';
@@ -235,7 +232,7 @@ function Test-cbtBackupsCoverage {
 		
 		[PSCustomObject[]]$gaps = @();
 		[PSCustomObject]$previousLogFile = $null;
-		foreach ($logBackup in $Manifest | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+		foreach ($logBackup in $Manifest.Files | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
 			[TimeSpan]$span = $logBackup.TimeStamp - $previousStart;
 			if ($span.TotalSeconds -gt $RpoSeconds) {
 				$gaps += @{
