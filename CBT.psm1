@@ -3,7 +3,6 @@
 ##############################################################################################################
 ##  Public:
 ##############################################################################################################
-
 function Build-cbtS3BackupsFileManifest {
 	param (
 		[Parameter(Mandatory)]
@@ -16,10 +15,14 @@ function Build-cbtS3BackupsFileManifest {
 	);
 	
 	begin {
+		if (-not (Test-cbtS3SecurityInfoIsSet)) {
+			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
+		}
+		
 		filter Get-S3FileDetailsByPath {
 			param (
+				[ValidateSet("FULL", "DIFF", "LOG")]
 				[string]$Type,
-				# FULL, DIFF, LOG
 				[DateTime]$Predecessor = [DateTime]::MinValue # i.e., previous file in the restore-chain (DIFF or FULL)
 			);
 			
@@ -64,7 +67,6 @@ function Build-cbtS3BackupsFileManifest {
 				}
 			}
 			
-			# NOTE: Because the filter here is on TimeStamp - any backups that are striped don't need any additional logic. 
 			switch ($Type) {
 				'FULL' {
 					return $fileDetails | Sort-Object -Property TimeStamp | Select-Object -Last 1;
@@ -106,7 +108,77 @@ function Build-cbtS3BackupsFileManifest {
 	}
 }
 
-filter Set-cbtS3SecurityInformation {
+function Copy-cbtS3BackupFilesLocally {
+	param (
+		[Parameter(Mandatory)]
+		[PSCustomObject]$Manifest,
+		[DateTime]$StopAt = [DateTime]::MinValue,			# ONLY exists for hand-off to RESTORE operations... 
+		[string]$TargetDirectory # hmm. do i need any kind of pattern thingy here? 
+		# TODO: Set up option for these if/as needed (which'll supersede the locally defined creds)
+		#$S3ArnRoleCredentials 
+	);
+	
+	begin {
+		if (-not (Test-cbtS3SecurityInfoIsSet)) {
+			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
+		}
+		
+		# TODO: normalize path for $TargetDirectory... i.e., if it ends with \ ... remove it. 
+		
+		if (-not (Test-Path $TargetDirectory)) {
+			# try to create the explicit path? 
+			
+			# and/or just throw? 
+		}
+		
+		filter Copy-S3FileToLocal {
+			param (
+				[PSCustomObject]$File
+			);
+			
+			Read-S3Object -BucketName ($Manifest.BucketName) -Key $File.FullPath -File "$TargetDirectory\$($Manifest.DatabaseName)\$($File.FileName)" | Out-Null;
+		}
+	};
+	
+	process {
+		
+		# NOTE: if there's NOT a FULL (or DIFF) backup - that's fine, we MIGHT be 'topping up' (synchronizing) additional backups/etc. 
+		$full = $Manifest | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
+		Copy-S3FileToLocal -File $full;
+		# TODO: OPTION to initiate/kick-off RESTORE operation. (This'd HAVE to be done via START of an MSDB JOB - so that this is asynchronous.)
+		
+		$diff = $Manifest | Where-Object { $_.BackupType -eq 'DIFF'	} | Select-Object -First 1;
+		Copy-S3FileToLocal -File $diff;
+		# TODO: OPTION to 'apply' (which is a bit complicated.)
+		# 		So. There are 2 main options for the ability to kick-off RESTORE operations here. 
+		# 		a) WAIT UNTIL we get to a DIFF (if there is/was one - i.e., BEFORE we start on LOGs). And then just restore FULL + DIFF (if there was one). 		
+		# 		b) TWEAK admindb/S4's dbo.restore_databases. KEEP the OPTION to 'REPLACE', default that to 'THROW', and provide a new option for 'APPLY'... 
+		# 			and then change the name of the variable. Idea then becomes that dbo.restore_databases CAN 'pick up' from a previous RESTORE and attempt
+		# 			to simply apply a DIFF, then LOGs, or JUST logs (though... that's starting to be a hell of an overlap on/against dbo.apply_logs)
+		# 				ah. woah. maybe dbo.restore_databases calls into dbo.apply_logs once we get to logs? 
+		
+		foreach ($logBackup in $Manifest | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+			Copy-S3FileToLocal -File $logBackup;
+		}
+	};
+	
+	end {
+		
+	};
+	
+
+	
+}
+
+function Remove-cbtManifestEntriesForLocallyAvailableFiles {
+	# yeah.. that's a mouthful... 
+	# but... let's assume we generate a manifest of everything needed to restore a given database... 
+	# 		this gives us the OPTION to zip in, enumerate those entries vs locally available files... 
+	# 			and remove (or flag as already downloaded?) any files already on-box. 
+	# 			the rub, of course, is that we might need to compare file-sizes? 
+}
+
+function Set-cbtS3SecurityInformation {
 	param (
 		[Parameter(Mandatory)]
 		[string]$Region,
@@ -130,10 +202,10 @@ filter Set-cbtS3SecurityInformation {
 # 			this is going through the contents of that HashTable - one row at a time. 
 # 			that's ... not what I want. 
 # 		which means I'm probably going to have to build a more custom class/object . 
-
 function Test-cbtBackupsCoverage {
 	param (
-		[Parameter(Mandatory, ValueFromPipeline)]
+		#[Parameter(Mandatory, ValueFromPipeline)]
+		[Parameter(Mandatory)]
 		[PSCustomObject]$Manifest,
 		[int]$RpoSeconds = 660,
 		[switch]$SkipDiffBackups = $true # Arguably, we're NOT just looking to see if we can recover without RPO violations; we're looking to see if there are ANY RPO violations within the backup chain. 
@@ -212,7 +284,7 @@ function Test-cbtBackupsCoverage {
 	};
 }
 
-filter Test-cbtS3SecurityInfoIsSet {
+function Test-cbtS3SecurityInfoIsSet {
 	$exists = Get-AWSCredential -ListProfileDetail;
 	if ($null -eq $exists) {
 		return $false;
@@ -255,4 +327,4 @@ filter Get-StripeNumberFromS3FileName {
 	return 0;
 }
 
-Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
+Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Copy-cbtS3BackupFilesLocally, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
