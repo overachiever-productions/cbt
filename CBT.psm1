@@ -44,6 +44,7 @@ function Build-cbtS3BackupsFileManifest {
 					TimeStamp  = $timestamp
 					FileName   = $fileName
 					FullPath   = $s3Object.Key
+					Size 	   = $s3Object.Size
 				};
 				
 				$fileDetails += $fileDetail;
@@ -117,9 +118,10 @@ function Copy-cbtS3BackupFilesLocally {
 		[Parameter(Mandatory, ValueFromPipeline)]
 		[PSCustomObject]$Manifest,
 		[DateTime]$StopAt = [DateTime]::MinValue,			# ONLY exists for hand-off to RESTORE operations... 
-		[string]$TargetDirectory # hmm. do i need any kind of pattern thingy here? 
+		[string]$TargetDirectory, # hmm. do i need any kind of pattern thingy here? 
 		# TODO: Set up option for these if/as needed (which'll supersede the locally defined creds)
 		#$S3ArnRoleCredentials 
+		[switch]$Force = $false  		# When TRUE, will re-download files if/when they're already present (path exists and file sizes are the same)
 	);
 	
 	begin {
@@ -140,10 +142,27 @@ function Copy-cbtS3BackupFilesLocally {
 				[PSCustomObject]$File
 			);
 			
-			Read-S3Object -BucketName ($Manifest.BucketName) -Key $File.FullPath -File "$TargetDirectory\$($Manifest.Database)\$($File.FileName)" | Out-Null;
+			try {
+				$targetPath = "$TargetDirectory\$($Manifest.Database)\$($File.FileName)";
+				
+				if (-not $Force) {
+					$localFile = Get-ChildItem $targetPath -ErrorAction SilentlyContinue;
+					if ($null -ne $localFile) {
+						if ($localFile.Length -eq $File.Size) {
+							Write-Verbose "File [$($File.FileName)] already exists locally - and has same file-length ([$($File.Size)]) as cloud file. Skipping Download.";
+							return;
+						}
+					}
+				}
+				
+				Read-S3Object -BucketName ($Manifest.BucketName) -Key $File.FullPath -File $targetPath | Out-Null;
+			}
+			catch {
+				throw;
+			}
 		}
 		
-		$progressPref = $global:ProgressPreference;
+		$progressPref = $global:ProgressPreference;  # gets reset to this value in end{}
 	};
 	
 	process {
@@ -151,11 +170,15 @@ function Copy-cbtS3BackupFilesLocally {
 		
 		# NOTE: if there's NOT a FULL (or DIFF) backup - that's fine, we MIGHT be 'topping up' (synchronizing) additional backups/etc. 
 		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
-		Copy-S3FileToLocal -File $full;
+		if ($null -ne $full) {
+			Copy-S3FileToLocal -File $full;
+		}
 		# TODO: OPTION to initiate/kick-off RESTORE operation. (This'd HAVE to be done via START of an MSDB JOB - so that this is asynchronous.)
 		
 		$diff = $Manifest.Files | Where-Object { $_.BackupType -eq 'DIFF'	} | Select-Object -First 1;
-		Copy-S3FileToLocal -File $diff;
+		if ($null -ne $diff) {
+			Copy-S3FileToLocal -File $diff;
+		}
 		# TODO: OPTION to 'apply' (which is a bit complicated.)
 		# 		So. There are 2 main options for the ability to kick-off RESTORE operations here. 
 		# 		a) WAIT UNTIL we get to a DIFF (if there is/was one - i.e., BEFORE we start on LOGs). And then just restore FULL + DIFF (if there was one). 		
@@ -174,13 +197,71 @@ function Copy-cbtS3BackupFilesLocally {
 	};
 }
 
-function Remove-cbtManifestEntriesForLocallyAvailableFiles {
-	# yeah.. that's a mouthful... 
-	# but... let's assume we generate a manifest of everything needed to restore a given database... 
-	# 		this gives us the OPTION to zip in, enumerate those entries vs locally available files... 
-	# 			and remove (or flag as already downloaded?) any files already on-box. 
-	# 			the rub, of course, is that we might need to compare file-sizes? 
+# TODO: MIGHT make sense to add a -PassThru here ... (just not sure how i'd differentiate that from the @results collection... )
+function Compare-cbtManifestAgainstLocalFiles {
+	param (
+		[Parameter(Mandatory, ValueFromPipeline)]
+		[PSCustomObject]$Manifest,
+		[string]$TargetDirectory,
+		[switch]$ShowMatches = $false    # by default, only show missing or different.
+	);
+	
+	begin {
+		if ($TargetDirectory.EndsWith('\')) {
+			$TargetDirectory = $TargetDirectory.Substring(0, $TargetDirectory.Length - 1);
+		}
+		
+		if (-not (Test-Path $TargetDirectory)) {
+			throw "Target Directory [$TargetDirectory] does NOT exist.";
+		}
+		
+		$results = @();
+	};
+	
+	process {
+		foreach ($manifestFile in $Manifest.Files) {
+			
+			# TODO: create an internal func/filter to return file-size (KB/MB/GB) based on overall SIZE of the file. e.g., a 222GB file shouldn't be reporting size as KB or MB... but as GB'
+			# 				likewise, no sense reporting on a 220KB log file in terms of GBs... 
+			
+			$targetPath = "$TargetDirectory\$($Manifest.Database)\$($manifestFile.FileName)";
+			$localFile = Get-ChildItem $targetPath -ErrorAction SilentlyContinue;
+			if ($null -ne $localFile) {
+				if ($localFile.Length -eq $manifestFile.Size) {
+					if ($ShowMatches) {
+						$results += @{
+							Static	= "Cloud and Local Files are Identical"
+							File	= "$($manifestFile.FileName). Size: ($($manifestFile.Size / 1MB)MB).";
+						}
+					}
+				}
+				else {
+					$results += @{
+						Status	= "Different-File-Sizes"
+						File	= "$($manifestFile.FileName). Cloud: ($($manifestFile.Size / 1MB)MB) - Local: ($($localFile.Length / 1MB)).";
+					}
+				}
+			}
+			else {
+				$results += @{
+					Status	= "Cloud-Only"
+					File	= "$($manifestFile.FileName). Size: ($($manifestFile.Size / 1MB)MB)";
+				}
+			}
+		}
+	};
+	
+	end {
+		
+		# this needs better factors (i.e., probably custom formatting):
+		if ($results.Count -lt 1) {
+			Write-Host "Manifest and Local Files are IDENTICAL.";
+		}
+		
+		return $results;
+	};
 }
+
 
 function Set-cbtS3SecurityInformation {
 	param (
@@ -323,4 +404,4 @@ filter Get-StripeNumberFromS3FileName {
 	return 0;
 }
 
-Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Copy-cbtS3BackupFilesLocally, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
+Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Compare-cbtManifestAgainstLocalFiles, Copy-cbtS3BackupFilesLocally, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
