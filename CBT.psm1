@@ -3,23 +3,25 @@
 ##############################################################################################################
 ##  Public:
 ##############################################################################################################
-
 function Build-cbtS3BackupsFileManifest {
 	param (
 		[Parameter(Mandatory)]
 		[string]$BucketName,
-		# TODO: might need some sort of @{} (dictionary) of path prefixes - for situations where FULL|DIFF|LOG files are kept in different buckets.
-		[string]$PathPrefix = "",
+		[string]$PathPrefix = "",   # TODO: might need some sort of @{} (dictionary) of path prefixes - for situations where FULL|DIFF|LOG files are kept in different buckets.
 		[Parameter(Mandatory)]
 		[string]$Database,
 		[DateTime]$StopAt = [DateTime]::MinValue # When $StopAt is a) specified, and b) 'farther back' than most RECENT FULL/DIFF backups, this'll grab most recent files from BEFORE $StopAt
 	);
 	
 	begin {
+		if (-not (Test-cbtS3SecurityInfoIsSet)) {
+			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
+		}
+		
 		filter Get-S3FileDetailsByPath {
 			param (
+				[ValidateSet("FULL", "DIFF", "LOG")]
 				[string]$Type,
-				# FULL, DIFF, LOG
 				[DateTime]$Predecessor = [DateTime]::MinValue # i.e., previous file in the restore-chain (DIFF or FULL)
 			);
 			
@@ -36,12 +38,13 @@ function Build-cbtS3BackupsFileManifest {
 				[System.DateTime]$timestamp = Get-DateTimeFromS3FileName -FileName $fileName;
 				[int]$stripe = Get-StripeNumberFromS3FileName -FileName $fileName;
 				
-				$fileDetail = @{
+				[PSCustomObject]$fileDetail = [PSCustomObject]@{
 					BackupType = $Type.ToUpperInvariant()
 					Stripe	   = $stripe
 					TimeStamp  = $timestamp
 					FileName   = $fileName
 					FullPath   = $s3Object.Key
+					Size 	   = $s3Object.Size
 				};
 				
 				$fileDetails += $fileDetail;
@@ -64,7 +67,6 @@ function Build-cbtS3BackupsFileManifest {
 				}
 			}
 			
-			# NOTE: Because the filter here is on TimeStamp - any backups that are striped don't need any additional logic. 
 			switch ($Type) {
 				'FULL' {
 					return $fileDetails | Sort-Object -Property TimeStamp | Select-Object -Last 1;
@@ -78,7 +80,12 @@ function Build-cbtS3BackupsFileManifest {
 			}
 		}
 		
-		[PSCustomObject[]]$manifest = @();
+		[PSCustomObject]$manifest = [PSCustomObject]@{
+			PSTypeName = "CloudFilesManifest"
+			BucketName = $BucketName
+			Database = $Database
+			Files = @()
+		};
 	}
 	
 	process {
@@ -89,16 +96,16 @@ function Build-cbtS3BackupsFileManifest {
 		
 		Write-Verbose "Starting Manifest with FULL Backup: [$($full.FullPath)].";
 		
-		$manifest += $full;
+		$manifest.Files += $full;
 		$predecessor = $full.TimeStamp;
 		
 		$diff = Get-S3FileDetailsByPath -Type 'DIFF' -Predecessor $predecessor;
 		if ($null -ne $diff) {
 			$predecessor = $diff.TimeStamp;
-			$manifest += $diff;
+			$manifest.Files += $diff;
 		}
 		
-		$manifest += Get-S3FileDetailsByPath -Type 'LOG' -Predecessor $predecessor;
+		$manifest.Files += Get-S3FileDetailsByPath -Type 'LOG' -Predecessor $predecessor;
 	}
 	
 	end {
@@ -106,7 +113,157 @@ function Build-cbtS3BackupsFileManifest {
 	}
 }
 
-filter Set-cbtS3SecurityInformation {
+function Copy-cbtS3BackupFilesLocally {
+	param (
+		[Parameter(Mandatory, ValueFromPipeline)]
+		[PSCustomObject]$Manifest,
+		[DateTime]$StopAt = [DateTime]::MinValue,			# ONLY exists for hand-off to RESTORE operations... 
+		[string]$TargetDirectory, # hmm. do i need any kind of pattern thingy here? 
+		# TODO: Set up option for these if/as needed (which'll supersede the locally defined creds)
+		#$S3ArnRoleCredentials 
+		[switch]$Force = $false  		# When TRUE, will re-download files if/when they're already present (path exists and file sizes are the same)
+	);
+	
+	begin {
+		if (-not (Test-cbtS3SecurityInfoIsSet)) {
+			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
+		}
+		
+		if ($TargetDirectory.EndsWith('\')) {
+			$TargetDirectory = $TargetDirectory.Substring(0, $TargetDirectory.Length - 1);
+		}
+		
+		if (-not (Test-Path $TargetDirectory)) {
+			throw "Target Directory [$TargetDirectory] does NOT exist.";
+		}
+		
+		filter Copy-S3FileToLocal {
+			param (
+				[PSCustomObject]$File
+			);
+			
+			try {
+				$targetPath = "$TargetDirectory\$($Manifest.Database)\$($File.FileName)";
+				
+				if (-not $Force) {
+					$localFile = Get-ChildItem $targetPath -ErrorAction SilentlyContinue;
+					if ($null -ne $localFile) {
+						if ($localFile.Length -eq $File.Size) {
+							Write-Verbose "File [$($File.FileName)] already exists locally - and has same file-length ([$($File.Size)]) as cloud file. Skipping Download.";
+							return;
+						}
+					}
+				}
+				
+				Read-S3Object -BucketName ($Manifest.BucketName) -Key $File.FullPath -File $targetPath | Out-Null;
+			}
+			catch {
+				throw;
+			}
+		}
+		
+		$progressPref = $global:ProgressPreference;  # gets reset to this value in end{}
+	};
+	
+	process {
+		$global:ProgressPreference = [System.Management.Automation.ActionPreference]::SilentlyContinue;
+		
+		# NOTE: if there's NOT a FULL (or DIFF) backup - that's fine, we MIGHT be 'topping up' (synchronizing) additional backups/etc. 
+		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
+		if ($null -ne $full) {
+			Copy-S3FileToLocal -File $full;
+		}
+		# TODO: OPTION to initiate/kick-off RESTORE operation. (This'd HAVE to be done via START of an MSDB JOB - so that this is asynchronous.)
+		
+		$diff = $Manifest.Files | Where-Object { $_.BackupType -eq 'DIFF'	} | Select-Object -First 1;
+		if ($null -ne $diff) {
+			Copy-S3FileToLocal -File $diff;
+		}
+		# TODO: OPTION to 'apply' (which is a bit complicated.)
+		# 		So. There are 2 main options for the ability to kick-off RESTORE operations here. 
+		# 		a) WAIT UNTIL we get to a DIFF (if there is/was one - i.e., BEFORE we start on LOGs). And then just restore FULL + DIFF (if there was one). 		
+		# 		b) TWEAK admindb/S4's dbo.restore_databases. KEEP the OPTION to 'REPLACE', default that to 'THROW', and provide a new option for 'APPLY'... 
+		# 			and then change the name of the variable. Idea then becomes that dbo.restore_databases CAN 'pick up' from a previous RESTORE and attempt
+		# 			to simply apply a DIFF, then LOGs, or JUST logs (though... that's starting to be a hell of an overlap on/against dbo.apply_logs)
+		# 				ah. woah. maybe dbo.restore_databases calls into dbo.apply_logs once we get to logs? 
+		
+		foreach ($logBackup in $Manifest.Files | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+			Copy-S3FileToLocal -File $logBackup;
+		}
+	};
+	
+	end {
+		$global:ProgressPreference = $progressPref;
+	};
+}
+
+# TODO: MIGHT make sense to add a -PassThru here ... (just not sure how i'd differentiate that from the @results collection... )
+function Compare-cbtManifestAgainstLocalFiles {
+	param (
+		[Parameter(Mandatory, ValueFromPipeline)]
+		[PSCustomObject]$Manifest,
+		[string]$TargetDirectory,
+		[switch]$ShowMatches = $false    # by default, only show missing or different.
+	);
+	
+	begin {
+		if ($TargetDirectory.EndsWith('\')) {
+			$TargetDirectory = $TargetDirectory.Substring(0, $TargetDirectory.Length - 1);
+		}
+		
+		if (-not (Test-Path $TargetDirectory)) {
+			throw "Target Directory [$TargetDirectory] does NOT exist.";
+		}
+		
+		$results = @();
+	};
+	
+	process {
+		foreach ($manifestFile in $Manifest.Files) {
+			
+			# TODO: create an internal func/filter to return file-size (KB/MB/GB) based on overall SIZE of the file. e.g., a 222GB file shouldn't be reporting size as KB or MB... but as GB'
+			# 				likewise, no sense reporting on a 220KB log file in terms of GBs... 
+			
+			$targetPath = "$TargetDirectory\$($Manifest.Database)\$($manifestFile.FileName)";
+			$localFile = Get-ChildItem $targetPath -ErrorAction SilentlyContinue;
+			if ($null -ne $localFile) {
+				if ($localFile.Length -eq $manifestFile.Size) {
+					if ($ShowMatches) {
+						$results += @{
+							Static	= "Cloud and Local Files are Identical"
+							File	= "$($manifestFile.FileName). Size: ($($manifestFile.Size / 1MB)MB).";
+						}
+					}
+				}
+				else {
+					$results += @{
+						Status	= "Different-File-Sizes"
+						File	= "$($manifestFile.FileName). Cloud: ($($manifestFile.Size / 1MB)MB) - Local: ($($localFile.Length / 1MB)).";
+					}
+				}
+			}
+			else {
+				$results += @{
+					Status	= "Cloud-Only"
+					File	= "$($manifestFile.FileName). Size: ($($manifestFile.Size / 1MB)MB)";
+				}
+			}
+		}
+	};
+	
+	end {
+		
+		# this needs better factors (i.e., probably custom formatting):
+		if ($results.Count -lt 1) {
+			Write-Host "Manifest and Local Files are IDENTICAL.";
+		}
+		
+		return $results;
+	};
+}
+
+
+function Set-cbtS3SecurityInformation {
 	param (
 		[Parameter(Mandatory)]
 		[string]$Region,
@@ -124,13 +281,6 @@ filter Set-cbtS3SecurityInformation {
 	Initialize-AWSDefaultConfiguration -Region $Region -AccessKey ($SecretAndKeyAsCredentials.UserName) -SecretKey ($SecretAndKeyAsCredentials.GetNetworkCredential().Password);
 }
 
-# BARF. 
-# 	I mean, I know how ValueFromPipeline works... but... 
-# 		because I'm using a hashtable (PSCustomObject) for the output of Build-xxxManifest.... 
-# 			this is going through the contents of that HashTable - one row at a time. 
-# 			that's ... not what I want. 
-# 		which means I'm probably going to have to build a more custom class/object . 
-
 function Test-cbtBackupsCoverage {
 	param (
 		[Parameter(Mandatory, ValueFromPipeline)]
@@ -144,7 +294,7 @@ function Test-cbtBackupsCoverage {
 	};
 	
 	process {
-		$full = $Manifest | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
+		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
 		
 		[DateTime]$previousStart = $full.TimeStamp;
 		$previousFile = 'FULL';
@@ -153,7 +303,7 @@ function Test-cbtBackupsCoverage {
 			
 			Write-Verbose "-SkipDiffBackups is `$true. Checking for DIFF Backup....";
 			
-			$diff = $Manifest | Where-Object { $_.BackupType -eq 'DIFF' } | Select-Object -First 1;
+			$diff = $Manifest.Files | Where-Object { $_.BackupType -eq 'DIFF' } | Select-Object -First 1;
 			if ($null -ne $diff) {
 				$previousStart = $diff.TimeStamp;
 				$previousFile = 'DIFF';
@@ -163,7 +313,7 @@ function Test-cbtBackupsCoverage {
 		
 		[PSCustomObject[]]$gaps = @();
 		[PSCustomObject]$previousLogFile = $null;
-		foreach ($logBackup in $Manifest | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+		foreach ($logBackup in $Manifest.Files | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
 			[TimeSpan]$span = $logBackup.TimeStamp - $previousStart;
 			if ($span.TotalSeconds -gt $RpoSeconds) {
 				$gaps += @{
@@ -212,7 +362,7 @@ function Test-cbtBackupsCoverage {
 	};
 }
 
-filter Test-cbtS3SecurityInfoIsSet {
+function Test-cbtS3SecurityInfoIsSet {
 	$exists = Get-AWSCredential -ListProfileDetail;
 	if ($null -eq $exists) {
 		return $false;
@@ -224,7 +374,6 @@ filter Test-cbtS3SecurityInfoIsSet {
 ##############################################################################################################
 ##  Internal:
 ##############################################################################################################
-
 filter Get-DateTimeFromS3FileName {
 	param (
 		[string]$FileName
@@ -255,4 +404,4 @@ filter Get-StripeNumberFromS3FileName {
 	return 0;
 }
 
-Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
+Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Compare-cbtManifestAgainstLocalFiles, Copy-cbtS3BackupFilesLocally, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
