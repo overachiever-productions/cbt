@@ -1,0 +1,14 @@
+﻿<Project Synchronized="False" SyncFilter="*.ps1;*.psm1;*.psd1;*.ps1xml;*.psf;*.pss;*.xml;*.help.txt" AutoExportFunctions="True" ExportToLocalMachine="False" AutoExportPS1XMLFiles="True" StagingFolderName="bin">
+  <Version>2.1</Version>
+  <FileID>538cdae1-b45b-4f06-a3c5-ae2e77d06678</FileID>
+  <ProjectType>1</ProjectType>
+  <RememberPowerShellVersion>True</RememberPowerShellVersion>
+  <PowerShellVersion>Local Machine - PowerShell V7 (64 Bit)</PowerShellVersion>
+  <Folders />
+  <Files>
+    <File Build="2">CBT.psd1</File>
+    <File Build="0" Shared="True" ExportFunctions="True">CBT.psm1</File>
+    <File Build="2" Shared="True" ReferenceFunction="Invoke-test_ps1" ExportFunctions="False">test.ps1</File>
+  </Files>
+  <StartupScript>Test-Module.ps1</StartupScript>
+</Project>
