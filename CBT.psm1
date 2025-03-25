@@ -70,14 +70,10 @@ function Build-cbtS3BackupsFileManifest {
 					return $fileDetails | Sort-Object -Property TimeStamp | Select-Object -Last 1;
 				}
 				'DIFF' {
-					return $fileDetails | Where-Object {
-						$_.TimeStamp -gt $Predecessor
-					} |  Sort-Object -Property TimeStamp | Select-Object -Last 1;
+					return $fileDetails | Where-Object { $_.TimeStamp -gt $Predecessor } |  Sort-Object -Property TimeStamp | Select-Object -Last 1;
 				}
 				'LOG' {
-					return $fileDetails | Where-Object {
-						$_.TimeStamp -gt $Predecessor
-					} | Sort-Object -Property TimeStamp;
+					return $fileDetails | Where-Object { $_.TimeStamp -gt $Predecessor } | Sort-Object -Property TimeStamp;
 				}
 			}
 		}
@@ -128,6 +124,94 @@ filter Set-cbtS3SecurityInformation {
 	Initialize-AWSDefaultConfiguration -Region $Region -AccessKey ($SecretAndKeyAsCredentials.UserName) -SecretKey ($SecretAndKeyAsCredentials.GetNetworkCredential().Password);
 }
 
+# BARF. 
+# 	I mean, I know how ValueFromPipeline works... but... 
+# 		because I'm using a hashtable (PSCustomObject) for the output of Build-xxxManifest.... 
+# 			this is going through the contents of that HashTable - one row at a time. 
+# 			that's ... not what I want. 
+# 		which means I'm probably going to have to build a more custom class/object . 
+
+function Test-cbtBackupsCoverage {
+	param (
+		[Parameter(Mandatory, ValueFromPipeline)]
+		[PSCustomObject]$Manifest,
+		[int]$RpoSeconds = 660,
+		[switch]$SkipDiffBackups = $true # Arguably, we're NOT just looking to see if we can recover without RPO violations; we're looking to see if there are ANY RPO violations within the backup chain. 
+	);
+	
+	begin {
+		
+	};
+	
+	process {
+		$full = $Manifest | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
+		
+		[DateTime]$previousStart = $full.TimeStamp;
+		$previousFile = 'FULL';
+		
+		if (-not $SkipDiffBackups) {
+			
+			Write-Verbose "-SkipDiffBackups is `$true. Checking for DIFF Backup....";
+			
+			$diff = $Manifest | Where-Object { $_.BackupType -eq 'DIFF' } | Select-Object -First 1;
+			if ($null -ne $diff) {
+				$previousStart = $diff.TimeStamp;
+				$previousFile = 'DIFF';
+				Write-Verbose "`tDIFF Found.";
+			}
+		}
+		
+		[PSCustomObject[]]$gaps = @();
+		[PSCustomObject]$previousLogFile = $null;
+		foreach ($logBackup in $Manifest | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
+			[TimeSpan]$span = $logBackup.TimeStamp - $previousStart;
+			if ($span.TotalSeconds -gt $RpoSeconds) {
+				$gaps += @{
+					GapType	      		= "$($previousFile)-to-LOG"; # could be between FULL\DIFF and LOG, or could be between LOG and LOG.
+					GapSeconds    		= $span.TotalSeconds;
+					RpoExceededBy 		= ($span.TotalSeconds - $RpoSeconds);
+					PreviousFile  		= $previousLogFile.FileName;
+					GappedFile    		= $logBackup.FileName;
+					PreviousTimeStamp 	= $previousLogFile.TimeStamp;
+					GappedTimeStamp 	= $logBackup.TimeStamp;
+					
+				}
+			}
+			
+			$previousFile = 'LOG';
+			$previousStart = $logBackup.TimeStamp;
+			$previousLogFile = $logBackup;
+		}
+		
+		# TODO: 
+		# 	NEED to account for TimeZone 'stuff' here. 
+		# 	both in terms of potentially the time-zone of the Server - where backups were taken. 
+		# 		and in terms of the time-zone where this script is running. HAPPILY, I can get that from the OS and such. 
+		# 			i.e., so, cast/convert the 'backup timezone if/as needed' - and if it's different than local/current ... do whatever. 
+		[DateTime]$dateTimeNowThatIsNotTimeZoneShifted = Get-Date;
+		[TimeSpan]$span = $dateTimeNowThatIsNotTimeZoneShifted - $previousStart;
+		if ($span.TotalSeconds -gt $RpoSeconds) {
+			
+			if ($previousFile -eq 'LOG') {
+				$previousFile = 'LATEST_LOG';
+			}
+			$gaps += @{
+				GapType	      		= "$($previousFile)-to-CHECK_TIME"; # there might not (yet?) be any DIFFs/T-LOGs... 
+				GapSeconds    		= $span.TotalSeconds;
+				RpoExceededBy 		= ($span.TotalSeconds - $RpoSeconds);
+				PreviousFile  		= $previousLogFile.FileName;
+				PreviousTimeStamp 	= $previousLogFile.TimeStamp;
+			}   
+		}		
+		
+		return $gaps;
+	};
+	
+	end {
+		
+	};
+}
+
 filter Test-cbtS3SecurityInfoIsSet {
 	$exists = Get-AWSCredential -ListProfileDetail;
 	if ($null -eq $exists) {
@@ -136,8 +220,6 @@ filter Test-cbtS3SecurityInfoIsSet {
 	
 	return $true;
 }
-
-
 
 ##############################################################################################################
 ##  Internal:
@@ -173,4 +255,4 @@ filter Get-StripeNumberFromS3FileName {
 	return 0;
 }
 
-Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Set-cbtS3SecurityInformation, Test-cbtS3SecurityInfoIsSet;
+Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
