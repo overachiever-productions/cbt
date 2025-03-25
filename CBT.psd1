@@ -1,6 +1,6 @@
 ﻿@{
 	RootModule = 'CBT.psm1'
-	ModuleVersion = '1.0.0.0'
+	ModuleVersion = '0.3.0'
 	GUID = '538cdae1-b45b-4f06-a3c5-ae2e77d06678'
 	Author = 'Michael K. Campbell'
 	CompanyName = 'OverAchiever Productions, LLC.'

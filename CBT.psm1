@@ -124,9 +124,16 @@ filter Set-cbtS3SecurityInformation {
 	Initialize-AWSDefaultConfiguration -Region $Region -AccessKey ($SecretAndKeyAsCredentials.UserName) -SecretKey ($SecretAndKeyAsCredentials.GetNetworkCredential().Password);
 }
 
+# BARF. 
+# 	I mean, I know how ValueFromPipeline works... but... 
+# 		because I'm using a hashtable (PSCustomObject) for the output of Build-xxxManifest.... 
+# 			this is going through the contents of that HashTable - one row at a time. 
+# 			that's ... not what I want. 
+# 		which means I'm probably going to have to build a more custom class/object . 
+
 function Test-cbtBackupsCoverage {
 	param (
-		[Parameter(Mandatory)]
+		[Parameter(Mandatory, ValueFromPipeline)]
 		[PSCustomObject]$Manifest,
 		[int]$RpoSeconds = 660,
 		[switch]$SkipDiffBackups = $true # Arguably, we're NOT just looking to see if we can recover without RPO violations; we're looking to see if there are ANY RPO violations within the backup chain. 
