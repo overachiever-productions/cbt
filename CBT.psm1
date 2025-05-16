@@ -85,7 +85,6 @@
 	);
 	
 	# TODO: IF $ServerName <> '' ... guess we can also look for just dbs against the specific server-name ? e.g., <prefix>/<database>/<serverName>/<type> ... 
-	
 	return $PathPrefix + "/$Database/$($Type.ToUpperInvariant())";
 }
 
@@ -129,8 +128,8 @@ function Build-cbtBackupsFileManifest {
 		# 		they both accepts the same 2x params: fileName, dbName. 
 		Define-PathProviderRouting -Providers $PathTranslators;
 		
-		New-Item -Path function:Provider-GetDateTimeFromFileName -Value ($TimeExtractor.ToString()) -Force;
-		New-Item -Path function:Provider-GetStripeFromFileName -Value ($StripeExtractor.ToString()) -Force;
+		New-Item -Path function:Provider-GetDateTimeFromFileName -Value ($TimeExtractor.ToString()) -Force | Out-Null;
+		New-Item -Path function:Provider-GetStripeFromFileName -Value ($StripeExtractor.ToString()) -Force | Out-Null;
 		
 		filter Get-FileDetailsByPath {
 			param (
@@ -143,16 +142,14 @@ function Build-cbtBackupsFileManifest {
 			if ($PathPrefix.EndsWith('/')) {
 				$PathPrefix = $PathPrefix.Substring(0, $PathPrefix.Length - 1);
 			}
-	Write-Host "prefix: $PathPrefix"		
-			#$path = $PathPrefix + "/$Database/$($Type.ToUpperInvariant())";
+				
 			$path = Get-ProviderTranslatedPath -PathPrefix $PathPrefix -Database $Database -Type $Type -ServerName $SourceServerName;
-Write-Host "path to get: $path"		
 			[PSCustomObject[]]$fileDetails = @();
 			$objects = Get-S3Object -BucketName $BucketName -Prefix $path;
-	Write-Host "objects: $objects"
+			
 			foreach ($object in $Objects) {
 				[string]$fileName = ($object.Key -split "/") | Select-Object -Last 1;
-	write-host "in loop"			
+						
 				try{
 					[System.DateTime]$timestamp = Provider-GetDateTimeFromFileName -FileName $fileName -DatabaseName $Database;
 				}
@@ -211,6 +208,7 @@ Write-Host "path to get: $path"
 		
 		[PSCustomObject]$manifest = [PSCustomObject]@{
 			PSTypeName = "CloudFilesManifest"
+			Provider = "S3"		# TODO: once dynamic providers are a feature, make sure to update this - i.e., FileSystem, B2, ABS (azure block storage), etc. 
 			BucketName = $BucketName
 			Database = $Database
 			Files = @()
@@ -412,7 +410,7 @@ function Set-cbtSecurityInformation {
 # NOTE: I should NOT need to pass in ANY transformers/funcs for extraction of timestamp or type into this func. that 'stuff' should have already been handled via Build-cbtS3BackupsManifest
 function Test-cbtBackupsCoverage {
 	param (
-		[Parameter(Mandatory, ValueFromPipeline)]
+		[Parameter(Mandatory, Position = 0, ValueFromPipeline)]
 		[PSCustomObject]$Manifest,
 		[int]$RpoSeconds = 660,
 		[switch]$SkipDiffBackups = $true # Arguably, we're NOT just looking to see if we can recover without RPO violations; we're looking to see if there are ANY RPO violations within the backup chain. 
@@ -424,6 +422,10 @@ function Test-cbtBackupsCoverage {
 	
 	process {
 		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL' } | Select-Object -First 1;
+		
+		if ($null -eq $full) {
+			throw "hmmm. don't think FULL can be missing/empty, right? ";
+		}
 		
 		[DateTime]$previousStart = $full.TimeStamp;
 		$previousFile = 'FULL';
@@ -644,4 +646,4 @@ filter Get-ProviderTranslatedPath {
 	return $outputPath;
 }
 
-Export-ModuleMember -Function Build-cbtBackupsFileManifest, Compare-cbtManifestAgainstLocalFiles, Copy-cbtBackupFilesLocally, Set-cbtSecurityInformation, Test-cbtBackupsCoverage, Test-cbtSecurityInfoIsSet;
+Export-ModuleMember -Function Build-cbtBackupsFileManifest, Copy-cbtBackupFilesLocally, Compare-cbtManifestAgainstLocalFiles, Set-cbtSecurityInformation, Test-cbtBackupsCoverage, Test-cbtSecurityInfoIsSet;
