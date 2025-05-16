@@ -1,50 +1,179 @@
 ﻿Set-StrictMode -Version 3.0;
 
-##############################################################################################################
-##  Public:
-##############################################################################################################
-function Build-cbtS3BackupsFileManifest {
+<# 
+	NOTES / SCOPE: 
+		S3, B2 and other 'prefixes' can/should exist. 
+		BUT, I'm going to use -CloudProvider or something similar to direct WHICH of these is responsible for getting stuff. 
+			which, yeah... means abstraction of the 'fetch' (i.e., get details) and 'copy' (download) operations for each provider. 
+
+		Likewise, paths... will assume/use providers. 
+
+	ROADMAP: 
+		More or less an extension of the above: 
+			- 0.3.0 - Bare-Bones Implementation. 
+				- Manifests						- DONE. 
+				- Manifest Testing (RPO checks) - DONE. 
+				- PATHs (providers/funcs) 		- PENDING. 
+				- DOWNLOADS	(S3 Only and hard-coded) - PENDING
+				
+			- 0.4.0 - 'Cloud Providers' - i.e., abstractions for different providers - enumerate/find files, get timestamps and other details, download/synchronize with local. 
+				- i.e., time to replace HARD-CODED S3 logic with: 
+					- options for authentication. 
+					- extensible 'providers' (i.e., abstraction). 
+					- MAKE SURE to START with support for both: 
+						- S3
+						- WindowFileSystem - i.e., no reason to NOT treat it like a 'cloud'. 
+							as, then, I can 'test' and/or restore from a UNC share/etc.
+#>
+
+# ===========================================================================================================
+# Providers (Defaults and Validation):
+# ===========================================================================================================
+# MKC: BUG/PROBLEM. No Idea what I'm doing wrong here - in terms of scope. 
+# 		but these 'variables' are 10000000% just NOT visible to Build-cbtBackupsFileManifest UNLESS they're declared globally here. 
+
+# TODO: should I be passing in $SourceServerName to these funcs? 
+[ScriptBlock]$global:cbt_s4Get_DateTimeFromFileName = {
+	param (
+		[string]$FileName,
+		[string]$DatabaseName
+	);
+	
+	try {
+		$parts = $FileName -Split "_";
+		$hour = $parts[6].Substring(0, 2);
+		$minute = $parts[6].Substring(2, 2);
+		$second = $parts[6].Substring(4, 2);
+		$millisecond = $parts[7].Substring(0, 3);
+		
+		return New-Object System.DateTime($parts[3], $parts[4], $parts[5], $hour, $minute, $second, $millisecond);
+	}
+	catch {
+		# MKC: no... don't handle this here ... handle it in the part of the code that runs this extraction - i.e., where this 'delegate/interface' is run. 
+		# 		that way I can keep errors fairly standard. 
+		throw "DateTime Extraction From File Error... "
+	}
+}
+
+[ScriptBlock]$global:cbt_s4Get_StripeNumberFromFileName = {
+	param (
+		[string]$FileName,
+		[string]$DatabaseName
+	);
+	
+	# place-holder for now. 
+	# i.e., not yet implemented. 
+	
+	return 0; # or -1? 
+}
+
+# MKC: Both of these funcs/ScriptBlocks are a LIE. They specify a list of $MatchingDatabases - but those are NEVER used within the func itself... (once it is created)
+# 	instead, those matches are 1) EXTRACTED (dynamically), 2) shoved into a hashtable, and 3) then used for 'routing' by logic below. 
+# 	ARGUABLY, COULD require users to pass in a compound object - an array of (Databases + ScriptBlock) that would do this same thing. 
+# 		but, seems a bit more EASY for devs/consumers of this to specify specific DBs and the logic they expect - in one 'tidy' definition. 
+# 		i.e., this LIES because it's easier for consumers.  That results in some contortion within the module .. but, meh. 
+
+# NOTE: 3x allowable tokens: USER (master, tempdb, msdb, model), USER: anything OTHER than SYSTEM, ALL = anything/everything.
+# TODO: maybe some sort of switch / $prefs something that lets us treat admindb as a systemdb? ah... and/or something that lets us a) modify SYSTEM (add/remove?) and/or, b) something that lets us create other 'collections'/tokens
+[ScriptBlock]$global:cbt_s4Get_SystemPaths = {
+	param (
+		[string[]]$MatchingDatabases = "{SYSTEM}",
+		[string]$PathPrefix,
+		[string]$Database,
+		[string]$Type,
+		[string]$ServerName = ""
+	);
+	
+	# TODO: IF $ServerName <> '' ... guess we can also look for just dbs against the specific server-name ? e.g., <prefix>/<database>/<serverName>/<type> ... 
+	
+	return $PathPrefix + "/$Database/$($Type.ToUpperInvariant())";
+}
+
+[ScriptBlock]$global:cbt_s4Get_UserPaths = {
+	param (
+		[string[]]$MatchingDatabases = "{USER}",
+		[string]$PathPrefix,
+		[string]$Database,
+		[string]$Type,
+		[string]$ServerName = ""
+	);
+	
+	return $PathPrefix + "/$Database/$($Type.ToUpperInvariant())";
+}
+
+[ScriptBlock[]]$global:cbt_s4Get_PathProviders = @($global:cbt_s4Get_SystemPaths, $global:cbt_s4Get_UserPaths);
+
+# ===========================================================================================================
+# Public:
+# ===========================================================================================================
+function Build-cbtBackupsFileManifest {
 	param (
 		[Parameter(Mandatory)]
 		[string]$BucketName,
 		[string]$PathPrefix = "",   # TODO: might need some sort of @{} (dictionary) of path prefixes - for situations where FULL|DIFF|LOG files are kept in different buckets.
 		[Parameter(Mandatory)]
 		[string]$Database,
-		[DateTime]$StopAt = [DateTime]::MinValue # When $StopAt is a) specified, and b) 'farther back' than most RECENT FULL/DIFF backups, this'll grab most recent files from BEFORE $StopAt
+		[string]$SourceServerName, 		# Optional - for situations/scenarios/paths that use the server-name for part of the backup. 
+		[DateTime]$StopAt = [DateTime]::MinValue, # When $StopAt is a) specified, and b) 'farther back' than most RECENT FULL/DIFF backups, this'll grab most recent files from BEFORE $StopAt
+		[ScriptBlock]$TimeExtractor = $global:cbt_s4Get_DateTimeFromFileName,
+		[ScriptBlock]$StripeExtractor = $global:cbt_s4Get_StripeNumberFromFileName,
+		[ScriptBlock[]]$PathTranslators = $global:cbt_s4Get_PathProviders
 	);
 	
 	begin {
-		if (-not (Test-cbtS3SecurityInfoIsSet)) {
+		if (-not (Test-cbtSecurityInfoIsSet)) {
 			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
 		}
 		
-		filter Get-S3FileDetailsByPath {
+		#TODO: validate the 'interfaces' of the $TimeExtractor and $StripeExtractor - i.e. make sure
+		# 		they both accepts the same 2x params: fileName, dbName. 
+		Define-PathProviderRouting -Providers $PathTranslators;
+		
+		New-Item -Path function:Provider-GetDateTimeFromFileName -Value ($TimeExtractor.ToString()) -Force;
+		New-Item -Path function:Provider-GetStripeFromFileName -Value ($StripeExtractor.ToString()) -Force;
+		
+		filter Get-FileDetailsByPath {
 			param (
 				[ValidateSet("FULL", "DIFF", "LOG")]
 				[string]$Type,
 				[DateTime]$Predecessor = [DateTime]::MinValue # i.e., previous file in the restore-chain (DIFF or FULL)
 			);
 			
+			# Path Normalization:
 			if ($PathPrefix.EndsWith('/')) {
 				$PathPrefix = $PathPrefix.Substring(0, $PathPrefix.Length - 1);
 			}
-			
-			$path = $PathPrefix + "/$Database/$($Type.ToUpperInvariant())";
-			
+	Write-Host "prefix: $PathPrefix"		
+			#$path = $PathPrefix + "/$Database/$($Type.ToUpperInvariant())";
+			$path = Get-ProviderTranslatedPath -PathPrefix $PathPrefix -Database $Database -Type $Type -ServerName $SourceServerName;
+Write-Host "path to get: $path"		
 			[PSCustomObject[]]$fileDetails = @();
-			$s3Objects = Get-S3Object -BucketName $BucketName -Prefix $path;
-			foreach ($s3Object in $s3Objects) {
-				[string]$fileName = ($s3Object.Key -split "/") | Select-Object -Last 1;
-				[System.DateTime]$timestamp = Get-DateTimeFromS3FileName -FileName $fileName;
-				[int]$stripe = Get-StripeNumberFromS3FileName -FileName $fileName;
+			$objects = Get-S3Object -BucketName $BucketName -Prefix $path;
+	Write-Host "objects: $objects"
+			foreach ($object in $Objects) {
+				[string]$fileName = ($object.Key -split "/") | Select-Object -Last 1;
+	write-host "in loop"			
+				try{
+					[System.DateTime]$timestamp = Provider-GetDateTimeFromFileName -FileName $fileName -DatabaseName $Database;
+				}
+				catch {
+					throw;
+				}
+				
+				try {
+					[int]$stripe = Provider-GetStripeFromFileName -FileName $fileName -DatabaseName $Database;
+				}
+				catch {
+					throw;
+				}
 				
 				[PSCustomObject]$fileDetail = [PSCustomObject]@{
 					BackupType = $Type.ToUpperInvariant()
 					Stripe	   = $stripe
 					TimeStamp  = $timestamp
 					FileName   = $fileName
-					FullPath   = $s3Object.Key
-					Size 	   = $s3Object.Size
+					FullPath   = $object.Key
+					Size 	   = $object.Size
 				};
 				
 				$fileDetails += $fileDetail;
@@ -89,7 +218,7 @@ function Build-cbtS3BackupsFileManifest {
 	}
 	
 	process {
-		$full = Get-S3FileDetailsByPath -Type 'FULL';
+		$full = Get-FileDetailsByPath -Type 'FULL';
 		if ($null -eq $full) {
 			throw "No Full-Backups found for Database [$Database] in Bucket [$BucketName] at Prefix: [$PathPrefix]. Can NOT continue building a Recovery-Manifest.";
 		}
@@ -99,13 +228,13 @@ function Build-cbtS3BackupsFileManifest {
 		$manifest.Files += $full;
 		$predecessor = $full.TimeStamp;
 		
-		$diff = Get-S3FileDetailsByPath -Type 'DIFF' -Predecessor $predecessor;
+		$diff = Get-FileDetailsByPath -Type 'DIFF' -Predecessor $predecessor;
 		if ($null -ne $diff) {
 			$predecessor = $diff.TimeStamp;
 			$manifest.Files += $diff;
 		}
 		
-		$manifest.Files += Get-S3FileDetailsByPath -Type 'LOG' -Predecessor $predecessor;
+		$manifest.Files += Get-FileDetailsByPath -Type 'LOG' -Predecessor $predecessor;
 	}
 	
 	end {
@@ -113,7 +242,7 @@ function Build-cbtS3BackupsFileManifest {
 	}
 }
 
-function Copy-cbtS3BackupFilesLocally {
+function Copy-cbtBackupFilesLocally {
 	param (
 		[Parameter(Mandatory, ValueFromPipeline)]
 		[PSCustomObject]$Manifest,
@@ -125,8 +254,8 @@ function Copy-cbtS3BackupFilesLocally {
 	);
 	
 	begin {
-		if (-not (Test-cbtS3SecurityInfoIsSet)) {
-			throw "Security Credentials have NOT been set. Use 'Set-cbtS3SecurityInformation' before proceeding.";
+		if (-not (Test-cbtSecurityInfoIsSet)) {
+			throw "Security Credentials have NOT been set. Use 'Set-cbtSecurityInformation' before proceeding.";
 		}
 		
 		if ($TargetDirectory.EndsWith('\')) {
@@ -137,7 +266,7 @@ function Copy-cbtS3BackupFilesLocally {
 			throw "Target Directory [$TargetDirectory] does NOT exist.";
 		}
 		
-		filter Copy-S3FileToLocal {
+		filter Copy-FileToLocal {
 			param (
 				[PSCustomObject]$File
 			);
@@ -171,13 +300,13 @@ function Copy-cbtS3BackupFilesLocally {
 		# NOTE: if there's NOT a FULL (or DIFF) backup - that's fine, we MIGHT be 'topping up' (synchronizing) additional backups/etc. 
 		$full = $Manifest.Files | Where-Object { $_.BackupType -eq 'FULL'	} | Select-Object -First 1;
 		if ($null -ne $full) {
-			Copy-S3FileToLocal -File $full;
+			Copy-FileToLocal -File $full;
 		}
 		# TODO: OPTION to initiate/kick-off RESTORE operation. (This'd HAVE to be done via START of an MSDB JOB - so that this is asynchronous.)
 		
 		$diff = $Manifest.Files | Where-Object { $_.BackupType -eq 'DIFF'	} | Select-Object -First 1;
 		if ($null -ne $diff) {
-			Copy-S3FileToLocal -File $diff;
+			Copy-FileToLocal -File $diff;
 		}
 		# TODO: OPTION to 'apply' (which is a bit complicated.)
 		# 		So. There are 2 main options for the ability to kick-off RESTORE operations here. 
@@ -188,7 +317,7 @@ function Copy-cbtS3BackupFilesLocally {
 		# 				ah. woah. maybe dbo.restore_databases calls into dbo.apply_logs once we get to logs? 
 		
 		foreach ($logBackup in $Manifest.Files | Where-Object { $_.BackupType -eq 'LOG'	} | Sort-Object { $_.TimeStamp }) {
-			Copy-S3FileToLocal -File $logBackup;
+			Copy-FileToLocal -File $logBackup;
 		}
 	};
 	
@@ -262,8 +391,7 @@ function Compare-cbtManifestAgainstLocalFiles {
 	};
 }
 
-
-function Set-cbtS3SecurityInformation {
+function Set-cbtSecurityInformation {
 	param (
 		[Parameter(Mandatory)]
 		[string]$Region,
@@ -272,7 +400,7 @@ function Set-cbtS3SecurityInformation {
 		[switch]$Overwrite = $false
 	);
 	
-	if (Test-S3SecurityInfoSet) {
+	if (Test-cbtSecurityInfoIsSet) {
 		if (-not $Overwrite) {
 			throw "S3SecurityInformation has ALREADY been set. Use the -Overwrite switch to force a replacement.";
 		}
@@ -281,6 +409,7 @@ function Set-cbtS3SecurityInformation {
 	Initialize-AWSDefaultConfiguration -Region $Region -AccessKey ($SecretAndKeyAsCredentials.UserName) -SecretKey ($SecretAndKeyAsCredentials.GetNetworkCredential().Password);
 }
 
+# NOTE: I should NOT need to pass in ANY transformers/funcs for extraction of timestamp or type into this func. that 'stuff' should have already been handled via Build-cbtS3BackupsManifest
 function Test-cbtBackupsCoverage {
 	param (
 		[Parameter(Mandatory, ValueFromPipeline)]
@@ -362,7 +491,7 @@ function Test-cbtBackupsCoverage {
 	};
 }
 
-function Test-cbtS3SecurityInfoIsSet {
+function Test-cbtSecurityInfoIsSet {
 	$exists = Get-AWSCredential -ListProfileDetail;
 	if ($null -eq $exists) {
 		return $false;
@@ -371,37 +500,148 @@ function Test-cbtS3SecurityInfoIsSet {
 	return $true;
 }
 
-##############################################################################################################
-##  Internal:
-##############################################################################################################
-filter Get-DateTimeFromS3FileName {
+# ===========================================================================================================
+# Internal:
+# ===========================================================================================================
+
+$global:cbt_systemDbs = @("master", "tempdb", "model", "msdb");
+$global:cbt_MappedPathingProviders = @{ };
+$global:cbt_CachedPathingProviders = @{ };
+filter Define-PathProviderRouting {
 	param (
-		[string]$FileName
-		# TODO: might need to send in some sort of template pattern? 
-		# 		if so, might need to SET that as a 'global' property vs having it sent in as an argument? 
+		[ScriptBlock[]]$Providers
 	);
 	
-	# This is 1000% hard-coded/keyed against S4 backup naming conventions:
-	# NOTE: i could treat this code "effectively like" a delegate - 
-	$parts = $FileName -Split "_";
-	$hour = $parts[6].Substring(0, 2);
-	$minute = $parts[6].Substring(2, 2);
-	$second = $parts[6].Substring(4, 2);
-	$millisecond = $parts[7].Substring(0, 3);
+	# always clear upon execution. 
+	$global:cbt_MappedPathingProviders = @{};
+	$global:cbt_CachedPathingProviders = @{};
+	[ScriptBlock]$wildcardMapper = $null;
+	[ScriptBlock]$systemDbMapper = $null;
+	[ScriptBlock]$userDbMapper = $null;
 	
-	return New-Object System.DateTime($parts[3], $parts[4], $parts[5], $hour, $minute, $second, $millisecond);
+	foreach ($provider in $Providers) {
+		
+		$specifiedDatabases = $provider.Ast.FindAll({
+				$args[0] -is [System.Management.Automation.Language.ParameterAst]
+			}, $false) | Where-Object {
+			$_.Name -like "*MatchingDatabases"
+		} | Select-Object -Property DefaultValue;
+		
+		$specifiedDatabases = ($specifiedDatabases.DefaultValue -replace '"', '');
+		
+		switch ($specifiedDatabases) {
+			{ $_ -in @("*", "{ALL}") } {
+				$wildcardMapper = $provider;
+			}
+			"{SYSTEM}" {
+				$systemDbMapper = $provider;
+			}
+			"{USER}" {
+				$userDbMapper = $provider;
+			}
+			default {
+				$global:cbtMappedPathingProviders[$specifiedDatabases] = $mapper;
+			}
+		}
+	}
+	
+	if ($null -ne $userDbMapper) {
+		$global:cbt_MappedPathingProviders["{USER}"] = $userDbMapper;
+	}
+	if ($null -ne $systemDbMapper) {
+		$global:cbt_MappedPathingProviders["{SYSTEM}"] = $systemDbMapper;
+	}
+	if ($null -ne $wildcardMapper) {
+		$global:cbt_MappedPathingProviders["{ALL}"] = $wildcardMapper;
+	}
 }
 
-filter Get-StripeNumberFromS3FileName {
+filter Get-PathTranslator {
 	param (
-		[string]$FileName
-		# TODO: might need to send in some sort of template pattern? 
-		# 		if so, might need to SET that as a 'global' property vs having it sent in as an argument? 
+		[string]$Database
 	);
 	
-	# NOT YET IMPLEMENTED.
+	if ($global:cbt_CachedPathingProviders.ContainsKey($Database)) {
+		Write-Debug "Returning Cached Provider.";
+		return $global:cbt_CachedPathingProviders[$Database];
+	}
 	
-	return 0;
+	if ($Database -in $global:cbt_systemDbs) {
+	Write-Host "$Database was in SYSTEM DBs."	
+		if ($global:cbt_MappedPathingProviders.ContainsKey("{SYSTEM}")) {
+			$output = $global:cbt_CachedPathingProviders[$Database];
+			$global:cbt_CachedPathingProviders[$Database] = $output;
+			return $output;
+		}
+	}
+	
+	# if NOT a system-database (or there was no explicit mapping for system-dbs):
+	foreach ($kvp in $global:cbt_MappedPathingProviders.GetEnumerator()) {
+		if ($kvp.Key -notin @("{ALL}", "{USER}", "{SYSTEM}")) {
+			if ($kvp.Key -like '*,*') {
+				if ($Database -in ($kvp.Key -split ',')) {
+					$global:cbt_CachedPathingProviders[$Database] = $kvp.Value;
+					return $kvp.Value;
+				}
+			}
+			else {
+				if ($kvp.Key -eq $Database) {
+					$global:cbt_CachedPathingProviders[$Database] = $kvp.Value;
+					return $kvp.Value;
+				}
+			}
+		}
+	}
+	
+	if ($global:cbt_MappedPathingProviders.ContainsKey("{USER}")) {
+		
+		$output = $global:cbt_MappedPathingProviders["{USER}"];
+		$global:cbt_CachedPathingProviders[$Database] = $output;
+		
+		return $output;
+	}
+	
+	if ($global:cbt_MappedPathingProviders.ContainsKey("{ALL}")) {
+		$output = $global:cbt_MappedPathingProviders["{ALL}"];
+		$global:cbt_CachedPathingProviders[$Database] = $output;
+		return $output;
+	}
+	
+	return $null;
 }
 
-Export-ModuleMember -Function Build-cbtS3BackupsFileManifest, Compare-cbtManifestAgainstLocalFiles, Copy-cbtS3BackupFilesLocally, Set-cbtS3SecurityInformation, Test-cbtBackupsCoverage, Test-cbtS3SecurityInfoIsSet;
+filter Get-ProviderTranslatedPath {
+	param (
+		[string]$PathPrefix,
+		[string]$Database,
+		[string]$Type,
+		[string]$ServerName = ""
+	);
+	
+	[ScriptBlock]$matchedProvider = Get-PathTranslator -Database $Database;
+	
+	if ($null -eq $matchedProvider) {
+		throw "ruh row... "
+	}
+	
+	# MKC: hmmm. I need named params here... to 'bypass' $MatchingDatabases
+	# 		right now, i'm testing a proof of concept. But... feels 'dirty' to keep spamming a func into creation ... 
+	# 			though... honestly, not a big deal (but... feels dirty)
+	# 		OTHER options: 
+	# 			A. move $MatchingDatabases to the BOTTOM of the list of params? 
+	# 				and then run the code like THIS: $matchedProvider.Invoke($PathPrefix, $Database, $Type, $ServerName); - i.e., .Invoke expects NAMED params. 
+	# 			B. similar to the above but look to see if I can SPLAT? params in a KVP/Hashtable? 
+	# 			C. MAYBE look at stripping OUT $MatchingDatabases (line/everything) from $matchingProvider AFTER I get the names of the DBs from the AST, but before I push into the hashtable
+	# 				that's used to grab the implementation code? 
+	try {
+		New-Item -Path function:cbt_temp_NeedsNamedParams -Value ($matchedProvider.ToString()) -Force | Out-Null;
+		$outputPath = cbt_temp_NeedsNamedParams -PathPrefix $PathPrefix -Database $Database -Type $Type -ServerName $ServerName;
+	}
+	catch {
+		throw;
+	}
+	
+	return $outputPath;
+}
+
+Export-ModuleMember -Function Build-cbtBackupsFileManifest, Compare-cbtManifestAgainstLocalFiles, Copy-cbtBackupFilesLocally, Set-cbtSecurityInformation, Test-cbtBackupsCoverage, Test-cbtSecurityInfoIsSet;

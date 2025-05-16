@@ -1,18 +1,22 @@
 ﻿
 Import-Module -Name "D:\Dropbox\Repositories\cbt" -Force;
 
-#$manifest = Build-cbtS3BackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing";
-
-#$manifest;
-#
-#Test-cbtBackupsCoverage -Manifest $manifest | ForEach-Object {
-#	Write-Host "----------------------------------";
-#	$_;
+#[ScriptBlock]$fileThingy = {
+#	param (
+#		[string]$FileName,
+#		[string]$DatabaseName
+#	);
+#	
+#	return "bite me";
 #}
 
-#Build-cbtS3BackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing" | Test-cbtBackupsCoverage;
 
-Build-cbtS3BackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing" | Compare-cbtManifestAgainstLocalFiles -TargetDirectory "X:\SQLBackups\";
+$manifest = Build-cbtBackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing"; # - TimeExtractor $fileThingy;
 
+$manifest.Files | ForEach-Object { $_ };
 
-Build-cbtS3BackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing" | Copy-cbtS3BackupFilesLocally -TargetDirectory "X:\SQLBackups\";
+#Build-cbtBackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing" | Test-cbtBackupsCoverage;
+
+Build-cbtBackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing" | Compare-cbtManifestAgainstLocalFiles -TargetDirectory "X:\SQLBackups\";
+
+Build-cbtBackupsFileManifest -BucketName "s4-tests" -PathPrefix "s3-backups-test" -Database "Billing" | Copy-cbtS3BackupFilesLocally -TargetDirectory "X:\SQLBackups\";
