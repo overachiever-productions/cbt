@@ -1,6 +1,11 @@
 ﻿Set-StrictMode -Version 3.0;
 
 <# 
+
+	RENAME: 
+		- To OBT or OSSBT: Offbox (SQL Server) Backup Tools. 
+		- Critical Backup tools ... no worky, it's too close to CBT. 
+
 	NOTES / SCOPE: 
 		S3, B2 and other 'prefixes' can/should exist. 
 		BUT, I'm going to use -CloudProvider or something similar to direct WHICH of these is responsible for getting stuff. 
@@ -11,19 +16,63 @@
 	ROADMAP: 
 		More or less an extension of the above: 
 			- 0.3.0 - Bare-Bones Implementation. 
-				- Manifests						- DONE. 
-				- Manifest Testing (RPO checks) - DONE. 
-				- PATHs (providers/funcs) 		- PENDING. 
-				- DOWNLOADS	(S3 Only and hard-coded) - PENDING
+				- Manifests													- DONE. 
+				- Manifest Testing (RPO checks) 							- DONE. 
+				- DOWNLOADS	(S3 Only and hard-coded) 						- DONE.
+				- PATHs (providers/funcs) 									- DONE.
+				- BUGFIX: (issue with [db_names]) (i.e., _ in names) 		- DONE. (Well, implemented within $script|$global:cbt_s4Get_DateTimeFromFileName. 
+				- BUGFIX: odd issue with $globalScope (providers below)		- PENDING
 				
+				
+			- 0.3.8 - Bare Bones - but Documented. 
+				To Document: 
+					- Module Installation and Import, etc. 
+					- SETTING default zone and creds for AWS. 
+					- Prefixes. 
+					- Server Names. 
+					- Basic operations - and the pipeline - i.e., create-manifest | check-manifest; or ... create_manifest | download-manifest-files and such. 
+					- CUSTOM Paths. 
+						A. Basic Idea: swappable/overwrite-able code that YOU can provide for YOUR environment for things like: extracting time from file-name, extracting timestamp from file-name, or ... controlling where FULLs are vs DIFFs , LOGs whatever. 
+						B. An 'oddity' with providers - i.e., Tokens for MatchingDatabases. This isn't code. It's passed in as a parameter, just cuz that's easier for authors. OSSBT then shreds your inputs into dictionary of options matching DB names/etc. ... i.e., it's a NICE lie. 
+						C. be careful when SPLITTING backup file-names into parts. 
+							e.g., default approach used by OSSBT is admindb/s4 convention - i.e., split by the "_" char. 
+								Only that's a huge problem if ... your database has the name "my_database" or something similar - you'll eff up the slots/spaces. 
+								translation - if you're using the value "x" for splitting/chunking, you'll want to watch for DBs with that exact char in the name. 
+								OSSBT uses a simple work-around for this - in the form of ... xxx. 
+									Yeah, it's hacky, but a) it's fast, b) it works, c) it works. 
+
 			- 0.4.0 - 'Cloud Providers' - i.e., abstractions for different providers - enumerate/find files, get timestamps and other details, download/synchronize with local. 
 				- i.e., time to replace HARD-CODED S3 logic with: 
 					- options for authentication. 
 					- extensible 'providers' (i.e., abstraction). 
 					- MAKE SURE to START with support for both: 
 						- S3
-						- WindowFileSystem - i.e., no reason to NOT treat it like a 'cloud'. 
+						- SMB - i.e., no reason to NOT treat it like a 'cloud'. 
 							as, then, I can 'test' and/or restore from a UNC share/etc.
+							 - CREDS? 
+
+						- B2
+							- hmm. would this need their little .exe deployed as well? 
+							- I THINK it would. 
+								Meaning, I think that B2 would be an optional provider in the form of a full-on diff 'project' - like OSSBT.B2
+									Which'd ... grab/download their .exe and place it on your box. 
+									and... wire up 'providers' for enumeration + download. 
+
+						-Azure? 
+							would probably have to be similar to the above (B2)? in that it's potentially a whole other set of downloads? 
+
+						- Which ... might mean that i technically 'need' OSSBT.S3 as well? don't really want to 'go there'. but I'll evaluate. 
+							actually. i think I just bundle, S3, SMB, Azure, B2 logic into this same, single, monolithic-y module (code within the module can be extensible/non-monolithic - but I don't need N projects).
+
+
+			- 0.4.2 - ditto (i.e., same as above) but with Docs. 
+				Things to document: 
+					- Examples
+						- Here's how to execute against S3
+						- Here's how to execute against an SMB share on your network. 
+						- Here's how to execute against B2. 
+						- or azure. 
+				!! obviously: need to make sure I've got the functionality in place to showcase these examples (i.e., not exactly sure how to tackle SMB auth... but... yeah). 
 #>
 
 # ===========================================================================================================
@@ -32,14 +81,22 @@
 # MKC: BUG/PROBLEM. No Idea what I'm doing wrong here - in terms of scope. 
 # 		but these 'variables' are 10000000% just NOT visible to Build-cbtBackupsFileManifest UNLESS they're declared globally here. 
 
-# TODO: should I be passing in $SourceServerName to these funcs? 
 [ScriptBlock]$global:cbt_s4Get_DateTimeFromFileName = {
 	param (
+		[Parameter(Mandatory)]
 		[string]$FileName,
-		[string]$DatabaseName
+		[Parameter(Mandatory)]
+		[string]$DatabaseName,
+		[string]$ServerName  # not needed by S4 ... but COULD, in theory, be needed by other providers. 
 	);
 	
 	try {
+		Write-Verbose "		Attempting Extraction of DateTime from File-Name: $FileName";
+		
+		if ($DatabaseName -like '*_*') {
+			$FileName = $FileName.Replace($DatabaseName, 'xxx');
+		}
+		
 		$parts = $FileName -Split "_";
 		$hour = $parts[6].Substring(0, 2);
 		$minute = $parts[6].Substring(2, 2);
@@ -64,7 +121,11 @@
 	# place-holder for now. 
 	# i.e., not yet implemented. 
 	
-	return 0; # or -1? 
+	# TODO: NOTE the need to potentially handle _'s in database-names - as per what's going on in $global:cbt_s4Get_DateTimeFromFileName
+	
+	
+	
+	return 1; # i.e., always assume only 1x file - until implemented.
 }
 
 # MKC: Both of these funcs/ScriptBlocks are a LIE. They specify a list of $MatchingDatabases - but those are NEVER used within the func itself... (once it is created)
@@ -77,7 +138,7 @@
 # TODO: maybe some sort of switch / $prefs something that lets us treat admindb as a systemdb? ah... and/or something that lets us a) modify SYSTEM (add/remove?) and/or, b) something that lets us create other 'collections'/tokens
 [ScriptBlock]$global:cbt_s4Get_SystemPaths = {
 	param (
-		[string[]]$MatchingDatabases = "{SYSTEM}",
+		[string[]]$MatchingDatabases = "{SYSTEM}",  ## NOTE this parameter is a LIE - it's actually used for hash-table mapping
 		[string]$PathPrefix,
 		[string]$Database,
 		[string]$Type,
@@ -90,7 +151,7 @@
 
 [ScriptBlock]$global:cbt_s4Get_UserPaths = {
 	param (
-		[string[]]$MatchingDatabases = "{USER}",
+		[string[]]$MatchingDatabases = "{USER}",	## NOTE this parameter is a LIE - it's actually used for hash-table mapping
 		[string]$PathPrefix,
 		[string]$Database,
 		[string]$Type,
@@ -114,9 +175,9 @@ function Build-cbtBackupsFileManifest {
 		[string]$Database,
 		[string]$SourceServerName, 		# Optional - for situations/scenarios/paths that use the server-name for part of the backup. 
 		[DateTime]$StopAt = [DateTime]::MinValue, # When $StopAt is a) specified, and b) 'farther back' than most RECENT FULL/DIFF backups, this'll grab most recent files from BEFORE $StopAt
+		[ScriptBlock[]]$PathTranslators = $global:cbt_s4Get_PathProviders,
 		[ScriptBlock]$TimeExtractor = $global:cbt_s4Get_DateTimeFromFileName,
-		[ScriptBlock]$StripeExtractor = $global:cbt_s4Get_StripeNumberFromFileName,
-		[ScriptBlock[]]$PathTranslators = $global:cbt_s4Get_PathProviders
+		[ScriptBlock]$StripeExtractor = $global:cbt_s4Get_StripeNumberFromFileName
 	);
 	
 	begin {
@@ -125,7 +186,7 @@ function Build-cbtBackupsFileManifest {
 		}
 		
 		#TODO: validate the 'interfaces' of the $TimeExtractor and $StripeExtractor - i.e. make sure
-		# 		they both accepts the same 2x params: fileName, dbName. 
+		# 		they both accept the same 2x params: fileName, dbName and... an optional -ServerName 
 		Define-PathProviderRouting -Providers $PathTranslators;
 		
 		New-Item -Path function:Provider-GetDateTimeFromFileName -Value ($TimeExtractor.ToString()) -Force | Out-Null;
@@ -142,8 +203,11 @@ function Build-cbtBackupsFileManifest {
 			if ($PathPrefix.EndsWith('/')) {
 				$PathPrefix = $PathPrefix.Substring(0, $PathPrefix.Length - 1);
 			}
-				
+			
 			$path = Get-ProviderTranslatedPath -PathPrefix $PathPrefix -Database $Database -Type $Type -ServerName $SourceServerName;
+			
+			Write-Verbose "Translated Path for [$Type] Backup: $($path)*"
+			
 			[PSCustomObject[]]$fileDetails = @();
 			$objects = Get-S3Object -BucketName $BucketName -Prefix $path;
 			
@@ -151,7 +215,7 @@ function Build-cbtBackupsFileManifest {
 				[string]$fileName = ($object.Key -split "/") | Select-Object -Last 1;
 						
 				try{
-					[System.DateTime]$timestamp = Provider-GetDateTimeFromFileName -FileName $fileName -DatabaseName $Database;
+					[System.DateTime]$timestamp = Provider-GetDateTimeFromFileName -FileName $fileName -DatabaseName $Database -ServerName $SourceServerName;
 				}
 				catch {
 					throw;
@@ -467,7 +531,7 @@ function Test-cbtBackupsCoverage {
 		# TODO: 
 		# 	NEED to account for TimeZone 'stuff' here. 
 		# 	both in terms of potentially the time-zone of the Server - where backups were taken. 
-		# 		and in terms of the time-zone where this script is running. HAPPILY, I can get that from the OS and such. 
+		# 		and in terms of the time-zone where this script is running. HAPPILY, I can get that (LOCAL server time-zone) from the OS and such. 
 		# 			i.e., so, cast/convert the 'backup timezone if/as needed' - and if it's different than local/current ... do whatever. 
 		[DateTime]$dateTimeNowThatIsNotTimeZoneShifted = Get-Date;
 		[TimeSpan]$span = $dateTimeNowThatIsNotTimeZoneShifted - $previousStart;
@@ -514,7 +578,7 @@ filter Define-PathProviderRouting {
 		[ScriptBlock[]]$Providers
 	);
 	
-	# always clear upon execution. 
+	# always clear upon execution: 
 	$global:cbt_MappedPathingProviders = @{};
 	$global:cbt_CachedPathingProviders = @{};
 	[ScriptBlock]$wildcardMapper = $null;
@@ -523,11 +587,7 @@ filter Define-PathProviderRouting {
 	
 	foreach ($provider in $Providers) {
 		
-		$specifiedDatabases = $provider.Ast.FindAll({
-				$args[0] -is [System.Management.Automation.Language.ParameterAst]
-			}, $false) | Where-Object {
-			$_.Name -like "*MatchingDatabases"
-		} | Select-Object -Property DefaultValue;
+		$specifiedDatabases = $provider.Ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ParameterAst]	}, $false) | Where-Object { $_.Name -like "*MatchingDatabases"	} | Select-Object -Property DefaultValue;
 		
 		$specifiedDatabases = ($specifiedDatabases.DefaultValue -replace '"', '');
 		

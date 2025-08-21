@@ -1,11 +1,11 @@
 ﻿@{
-	RootModule = 'CBT.psm1' # Contingency-Backups Tools  (sigh. Yeah, I knew there was something wrong with this name: CBT: cognitive behavioral therapy)
+	RootModule = 'CBT.psm1' 
 	ModuleVersion = '0.3.0'
 	GUID = '538cdae1-b45b-4f06-a3c5-ae2e77d06678'
 	Author = 'Michael K. Campbell'
 	CompanyName = 'OverAchiever Productions, LLC.'
 	Copyright = '(c) 2025. All rights reserved.'
-	Description = 'Module description'
+	Description = 'High-Level tools for interacting with (SQL Server) Contingency Backups.'
 	PowerShellVersion = '7.2'
 	DotNetFrameworkVersion = '8.0'
 	ProcessorArchitecture = 'None'
@@ -17,7 +17,7 @@
 	ScriptsToProcess = @()
 	TypesToProcess = @()
 	FormatsToProcess = @()
-	NestedModules = @()
+	NestedModules		   = @()
 	FunctionsToExport = @(
 		'cbt_s4Get_DateTimeFromFileName',
 		'cbt_s4Get_StripeNumberFromFileName',
@@ -35,7 +35,7 @@
 	) #For performance, list functions explicitly
 	CmdletsToExport = '*' 
 	VariablesToExport = '*'
-	AliasesToExport = '*' #For performance, list alias explicitly
+	AliasesToExport = '*'
 	ModuleList = @()
 	FileList = @()
 	PrivateData = @{
